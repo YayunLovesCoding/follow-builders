@@ -18,6 +18,7 @@
 
 import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 
@@ -41,16 +42,41 @@ const PROMPT_FILES = [
 
 // -- Fetch helpers -----------------------------------------------------------
 
+function curlFetchText(url) {
+  try {
+    const output = execFileSync(
+      'curl',
+      ['-sS', '-L', url],
+      { encoding: 'utf-8' }
+    );
+    return output;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  return res.json();
+  try {
+    const res = await fetch(url);
+    if (res.ok) return res.json();
+  } catch {}
+
+  const text = curlFetchText(url);
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 async function fetchText(url) {
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  return res.text();
+  try {
+    const res = await fetch(url);
+    if (res.ok) return res.text();
+  } catch {}
+
+  return curlFetchText(url);
 }
 
 // -- Main --------------------------------------------------------------------

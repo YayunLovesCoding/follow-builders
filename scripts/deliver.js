@@ -22,6 +22,7 @@
 
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { config as loadEnv } from 'dotenv';
@@ -58,6 +59,39 @@ async function getDigestText() {
   return Buffer.concat(chunks).toString('utf-8');
 }
 
+function curlRequest(url, { method = 'GET', headers = {}, body = null } = {}) {
+  const args = ['-sS', '-L', '-X', method];
+  for (const [key, value] of Object.entries(headers)) {
+    args.push('-H', `${key}: ${value}`);
+  }
+  if (body !== null) {
+    args.push('--data-binary', '@-');
+  }
+  args.push(url, '-w', '\n__STATUS__:%{http_code}');
+
+  const output = execFileSync('curl', args, {
+    input: body ?? undefined,
+    encoding: 'utf-8'
+  });
+
+  const marker = '\n__STATUS__:';
+  const idx = output.lastIndexOf(marker);
+  if (idx === -1) {
+    return { status: 0, body: output };
+  }
+  const responseBody = output.slice(0, idx);
+  const status = Number(output.slice(idx + marker.length).trim());
+  return { status, body: responseBody };
+}
+
+function parseJsonSafe(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 // -- Telegram Delivery -------------------------------------------------------
 
 // Sends the digest via Telegram Bot API.
@@ -82,38 +116,40 @@ async function sendTelegram(text, botToken, chatId) {
   }
 
   for (const chunk of chunks) {
-    const res = await fetch(
-      `https://api.telegram.org/bot${botToken}/sendMessage`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: chunk,
-          parse_mode: 'Markdown',
-          disable_web_page_preview: true
-        })
-      }
-    );
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const payload = JSON.stringify({
+      chat_id: chatId,
+      text: chunk,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true
+    });
 
-    if (!res.ok) {
-      const err = await res.json();
+    const res = curlRequest(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload
+    });
+
+    if (res.status < 200 || res.status >= 300) {
+      const err = parseJsonSafe(res.body) || {};
       // If Markdown parsing fails, retry without parse_mode
       if (err.description && err.description.includes("can't parse")) {
-        await fetch(
-          `https://api.telegram.org/bot${botToken}/sendMessage`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id: chatId,
-              text: chunk,
-              disable_web_page_preview: true
-            })
-          }
-        );
+        const retryPayload = JSON.stringify({
+          chat_id: chatId,
+          text: chunk,
+          disable_web_page_preview: true
+        });
+        const retryRes = curlRequest(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: retryPayload
+        });
+        if (retryRes.status < 200 || retryRes.status >= 300) {
+          const retryErr = parseJsonSafe(retryRes.body) || {};
+          throw new Error(`Telegram API error: ${retryErr.description || retryRes.body}`);
+        }
       } else {
-        throw new Error(`Telegram API error: ${err.description}`);
+        throw new Error(`Telegram API error: ${err.description || res.body}`);
       }
     }
 
@@ -127,7 +163,7 @@ async function sendTelegram(text, botToken, chatId) {
 // Sends the digest via Resend's email API.
 // The user provides their own Resend API key and email address.
 async function sendEmail(text, apiKey, toEmail) {
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = curlRequest('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -143,9 +179,9 @@ async function sendEmail(text, apiKey, toEmail) {
     })
   });
 
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(`Resend API error: ${err.message || JSON.stringify(err)}`);
+  if (res.status < 200 || res.status >= 300) {
+    const err = parseJsonSafe(res.body);
+    throw new Error(`Resend API error: ${err?.message || res.body}`);
   }
 }
 
